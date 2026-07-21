@@ -1,0 +1,146 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  wallet    Wallet?
+  seats     Seat[]
+  gamePlayers GamePlayer[]
+  waitingList WaitingList[]
+  handActions HandAction[]
+}
+
+model Wallet {
+  id           String   @id @default(cuid())
+  userId       String   @unique
+  balance      Int      @default(10000)
+  locked       Int      @default(0)
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id          String   @id @default(cuid())
+  walletId    String
+  amount      Int
+  balance     Int
+  type        String
+  referenceId String
+  description String
+  createdAt   DateTime @default(now())
+  wallet      Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
+}
+
+model PokerTable {
+  id          String   @id @default(cuid())
+  name        String
+  gameType    String   @default("NLH")
+  smallBlind  Int
+  bigBlind    Int
+  minBuyIn    Int
+  maxBuyIn    Int
+  maxPlayers  Int      @default(9)
+  status      String   @default("waiting")
+  currentGameId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  seats       Seat[]
+  games       Game[]
+  waitingList WaitingList[]
+}
+
+model Seat {
+  id         String     @id @default(cuid())
+  tableId    String
+  userId     String?
+  position   Int
+  stack      Int        @default(0)
+  isSitting  Boolean    @default(false)
+  isSitOut   Boolean    @default(false)
+  reservedAt DateTime?
+  reservedFor String?
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  table      PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  user       User?      @relation(fields: [userId], references: [id])
+  gamePlayers GamePlayer[]
+}
+
+model Game {
+  id          String   @id @default(cuid())
+  tableId     String
+  status      String   @default("waiting")
+  smallBlind  Int
+  bigBlind    Int
+  pot         Int      @default(0)
+  communityCards String?
+  dealerPosition Int    @default(0)
+  currentPlayerPosition Int @default(0)
+  winnerId    String?
+  createdAt   DateTime @default(now())
+  finishedAt  DateTime?
+  table       PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  players     GamePlayer[]
+  actions     HandAction[]
+}
+
+model GamePlayer {
+  id          String   @id @default(cuid())
+  gameId      String
+  userId      String
+  seatId      String
+  position    Int
+  holeCards   String?
+  stack       Int
+  bet         Int      @default(0)
+  isActive    Boolean  @default(true)
+  isAllIn     Boolean  @default(false)
+  hasFolded   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id])
+  seat        Seat     @relation(fields: [seatId], references: [id])
+  actions     HandAction[]
+}
+
+model HandAction {
+  id          String   @id @default(cuid())
+  gameId      String
+  playerId    String
+  userId      String
+  actionType  String
+  amount      Int      @default(0)
+  timestamp   DateTime @default(now())
+  game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  player      GamePlayer @relation(fields: [playerId], references: [id])
+  user        User     @relation(fields: [userId], references: [id])
+}
+
+model WaitingList {
+  id          String   @id @default(cuid())
+  tableId     String
+  userId      String
+  position    Int
+  createdAt   DateTime @default(now())
+  table       PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  user        User     @relation(fields: [userId], references: [id])
+}
+
+model SystemConfig {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       String
+  description String
+  updatedAt   DateTime @updatedAt
+}

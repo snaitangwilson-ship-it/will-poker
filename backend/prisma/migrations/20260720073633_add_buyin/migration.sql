@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "PokerTable" ADD COLUMN     "buyIn" INTEGER NOT NULL DEFAULT 1000;
