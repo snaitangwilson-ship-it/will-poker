@@ -1,106 +1,105 @@
-import React, { useState } from 'react';
+// frontend/src/components/BotControls.tsx
+import { useState } from 'react';
+import { authFetch } from '../lib/authFetch';
 
-const BACKEND_URL = 'https://jubilant-umbrella-wr654p57g66xh5g95-4000.app.github.dev';
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || 'http://localhost:4001';
 
 interface BotControlsProps {
   tableId: string;
   onBotsAdded: () => void;
 }
 
-export function BotControls({ tableId, onBotsAdded }: BotControlsProps) {
-  const [isLoading, setIsLoading] = useState(false);
-  const [botCount, setBotCount] = useState(1);
+export const BotControls = ({ tableId, onBotsAdded }: BotControlsProps) => {
+  const [count, setCount] = useState(1);
+  const [buyIn, setBuyIn] = useState(0);
+  const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState('');
 
   const addBots = async () => {
-    setIsLoading(true);
-    setMessage('Adding bots...');
+    setLoading(true);
+    setMessage('');
     try {
-      const res = await fetch(`${BACKEND_URL}/api/dev/add-bots`, {
+      const res = await authFetch(`${BACKEND_URL}/api/dev/add-bots`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          tableId,
-          count: botCount,
-          buyInAmount: 400
-        })
+        body: JSON.stringify({ tableId, count, buyInAmount: buyIn || undefined })
       });
       const data = await res.json();
       if (data.success) {
-        setMessage(`✅ Added ${data.botsAdded} bot(s). Total seated: ${data.totalSeated}`);
+        setMessage(`✅ ${data.botsAdded} bot(s) added. Total seated: ${data.totalSeated}`);
         onBotsAdded();
-        setTimeout(() => setMessage(''), 3000);
       } else {
         setMessage('❌ ' + (data.error || 'Failed to add bots'));
       }
     } catch (error) {
+      console.error('Error adding bots:', error);
       setMessage('❌ Error adding bots');
     }
-    setIsLoading(false);
+    setLoading(false);
   };
 
   const clearBots = async () => {
-    setIsLoading(true);
-    setMessage('Removing bots...');
+    setLoading(true);
+    setMessage('');
     try {
-      const res = await fetch(`${BACKEND_URL}/api/dev/clear-bots`, {
+      const res = await authFetch(`${BACKEND_URL}/api/dev/clear-bots`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tableId })
       });
       const data = await res.json();
       if (data.success) {
-        setMessage('✅ Bots removed');
+        setMessage('✅ Bots cleared');
         onBotsAdded();
-        setTimeout(() => setMessage(''), 3000);
       } else {
-        setMessage('❌ ' + (data.error || 'Failed to remove bots'));
+        setMessage('❌ ' + (data.error || 'Failed to clear bots'));
       }
     } catch (error) {
-      setMessage('❌ Error removing bots');
+      console.error('Error clearing bots:', error);
+      setMessage('❌ Error clearing bots');
     }
-    setIsLoading(false);
+    setLoading(false);
   };
 
-  // Only show in development
-  if (process.env.NODE_ENV === 'production') {
-    return null;
-  }
-
   return (
-    <div className="bg-gray-800/70 backdrop-blur-sm rounded-xl border border-gray-700/50 p-4 mb-4">
-      <div className="flex items-center gap-4 flex-wrap">
-        <div className="text-sm text-gray-400 font-medium">🤖 Developer Mode</div>
-        <div className="flex items-center gap-2">
-          <label className="text-gray-300 text-sm">Bots:</label>
+    <div className="bg-gray-800/50 rounded-lg p-4 border border-gray-700/50 mb-4">
+      <h4 className="text-white font-bold mb-2">🤖 Bot Controls</h4>
+      <div className="flex flex-wrap items-center gap-3">
+        <div>
+          <label className="text-gray-400 text-xs block">Count</label>
           <input
             type="number"
-            min="1"
-            max="8"
-            value={botCount}
-            onChange={(e) => setBotCount(Math.min(8, Math.max(1, parseInt(e.target.value) || 1)))}
-            className="w-16 bg-gray-700/50 border border-gray-600/50 text-white px-2 py-1 rounded-lg focus:outline-none focus:border-yellow-500/50"
+            min={1}
+            max={8}
+            value={count}
+            onChange={(e) => setCount(parseInt(e.target.value) || 1)}
+            className="bg-gray-700/50 border border-gray-600/50 text-white px-2 py-1 rounded w-16"
+          />
+        </div>
+        <div>
+          <label className="text-gray-400 text-xs block">Buy-in (₹)</label>
+          <input
+            type="number"
+            min={0}
+            value={buyIn}
+            onChange={(e) => setBuyIn(parseInt(e.target.value) || 0)}
+            className="bg-gray-700/50 border border-gray-600/50 text-white px-2 py-1 rounded w-24"
           />
         </div>
         <button
           onClick={addBots}
-          disabled={isLoading}
-          className="bg-green-600 hover:bg-green-500 px-4 py-1 rounded-lg text-white font-bold transition-all disabled:opacity-50"
+          disabled={loading}
+          className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-1 rounded text-sm font-bold disabled:opacity-50"
         >
-          {isLoading ? '...' : '➕ Add Bots'}
+          {loading ? '...' : 'Add Bots'}
         </button>
         <button
           onClick={clearBots}
-          disabled={isLoading}
-          className="bg-red-500/30 hover:bg-red-500/50 px-4 py-1 rounded-lg text-red-400 border border-red-500/30 transition-all disabled:opacity-50"
+          disabled={loading}
+          className="bg-red-600 hover:bg-red-500 text-white px-4 py-1 rounded text-sm font-bold disabled:opacity-50"
         >
-          🗑️ Clear Bots
+          Clear Bots
         </button>
-        {message && <span className={`text-sm ${message.includes('✅') ? 'text-green-400' : 'text-red-400'}`}>{message}</span>}
       </div>
-      <div className="text-xs text-gray-500 mt-1">
-        ⚡ Adds AI bots to test multiplayer flow. Available in development only.
-      </div>
+      {message && <p className="text-sm mt-2 text-gray-300">{message}</p>}
     </div>
   );
-}
+};

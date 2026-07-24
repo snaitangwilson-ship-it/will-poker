@@ -26,6 +26,6 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
 };
 
 export const adminMiddleware = async (req: Request, res: Response, next: NextFunction) => {
-  // This will be implemented with role-based access
+  // Implement role-based access control later
   next();
 };

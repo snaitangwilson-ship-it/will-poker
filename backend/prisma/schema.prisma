@@ -7,25 +7,44 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ---------- USERS & AUTH ----------
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  password  String
-  name      String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  wallet    Wallet?
-  seats     Seat[]
-  gamePlayers GamePlayer[]
-  waitingList WaitingList[]
-  handActions HandAction[]
+  id           String   @id @default(cuid())
+  email        String   @unique
+  password     String
+  name         String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  wallet       Wallet?
+  seats        Seat[]
+  sessions     Session[]
+  gamePlayers  GamePlayer[]
+  handActions  HandAction[]
+  waitingLists WaitingList[]
+  seatReservations SeatReservation[]
+  sittingOutPlayers SittingOutPlayer[]
 }
 
+model Session {
+  id         String   @id @default(cuid())
+  userId     String
+  token      String   @unique
+  ipAddress  String?
+  userAgent  String?
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ---------- WALLET ----------
 model Wallet {
   id           String   @id @default(cuid())
   userId       String   @unique
   balance      Int      @default(10000)
   locked       Int      @default(0)
+
   user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   transactions WalletTransaction[]
 }
@@ -39,25 +58,32 @@ model WalletTransaction {
   referenceId String
   description String
   createdAt   DateTime @default(now())
+
   wallet      Wallet   @relation(fields: [walletId], references: [id], onDelete: Cascade)
 }
 
+// ---------- TABLE & SEATS ----------
 model PokerTable {
-  id          String   @id @default(cuid())
-  name        String
-  gameType    String   @default("NLH")
-  smallBlind  Int
-  bigBlind    Int
-  minBuyIn    Int
-  maxBuyIn    Int
-  maxPlayers  Int      @default(9)
-  status      String   @default("waiting")
-  currentGameId String?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-  seats       Seat[]
-  games       Game[]
-  waitingList WaitingList[]
+  id             String   @id @default(cuid())
+  name           String
+  gameType       String   @default("NLH")
+  smallBlind     Int
+  bigBlind       Int
+  minBuyIn       Int
+  maxBuyIn       Int
+  maxPlayers     Int      @default(9)
+  status         String   @default("waiting")
+  currentGameId  String?
+  dealerPosition Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  seats          Seat[]
+  games          Game[]
+  waitingList    WaitingList[]
+  handHistory    HandHistory[]
+  seatReservations SeatReservation[]
+  sittingOutPlayers SittingOutPlayer[]
 }
 
 model Seat {
@@ -71,28 +97,46 @@ model Seat {
   reservedAt DateTime?
   reservedFor String?
   createdAt  DateTime   @default(now())
-  updatedAt  DateTime   @updatedAt
+
   table      PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
   user       User?      @relation(fields: [userId], references: [id])
   gamePlayers GamePlayer[]
+  seatReservation SeatReservation?
+  sittingOutPlayer SittingOutPlayer?
 }
 
+model WaitingList {
+  id        String   @id @default(cuid())
+  tableId   String
+  userId    String
+  position  Int
+  createdAt DateTime @default(now())
+
+  table     PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tableId, userId])
+}
+
+// ---------- GAME ENGINE ----------
 model Game {
   id          String   @id @default(cuid())
   tableId     String
   status      String   @default("waiting")
   smallBlind  Int
   bigBlind    Int
-  pot         Int      @default(0)
-  communityCards String?
-  dealerPosition Int    @default(0)
+  dealerPosition Int   @default(0)
   currentPlayerPosition Int @default(0)
-  winnerId    String?
+  currentBet  Int      @default(0)
+  pot         Int      @default(0)
   createdAt   DateTime @default(now())
   finishedAt  DateTime?
+
   table       PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
   players     GamePlayer[]
   actions     HandAction[]
+  pots        Pot[]
+  gameState   GameState?
 }
 
 model GamePlayer {
@@ -102,12 +146,13 @@ model GamePlayer {
   seatId      String
   position    Int
   holeCards   String?
-  stack       Int
+  stack       Int      @default(0)
   bet         Int      @default(0)
   isActive    Boolean  @default(true)
   isAllIn     Boolean  @default(false)
   hasFolded   Boolean  @default(false)
   createdAt   DateTime @default(now())
+
   game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
   user        User     @relation(fields: [userId], references: [id])
   seat        Seat     @relation(fields: [seatId], references: [id])
@@ -122,25 +167,80 @@ model HandAction {
   actionType  String
   amount      Int      @default(0)
   timestamp   DateTime @default(now())
+
   game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
   player      GamePlayer @relation(fields: [playerId], references: [id])
   user        User     @relation(fields: [userId], references: [id])
 }
 
-model WaitingList {
-  id          String   @id @default(cuid())
-  tableId     String
-  userId      String
-  position    Int
-  createdAt   DateTime @default(now())
-  table       PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
-  user        User     @relation(fields: [userId], references: [id])
+model Pot {
+  id             String   @id @default(cuid())
+  gameId         String
+  amount         Int      @default(0)
+  type           String   @default("main")
+  winnerId       String?
+  isDistributed  Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  game           Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
 }
 
-model SystemConfig {
-  id          String   @id @default(cuid())
-  key         String   @unique
-  value       String
-  description String
-  updatedAt   DateTime @updatedAt
+// ---------- HAND HISTORY ----------
+model HandHistory {
+  id         String   @id @default(cuid())
+  gameId     String
+  tableId    String
+  players    Json
+  actions    Json
+  pot        Int
+  board      Json
+  winnerId   String
+  winnerHand String
+  winners    Json
+  dealerId   String
+  rake       Int      @default(0)
+  createdAt  DateTime @default(now())
+
+  table      PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+}
+
+// ---------- PRODUCTION FEATURES ----------
+
+model GameState {
+  id        String   @id @default(cuid())
+  gameId    String   @unique
+  tableId   String
+  state     Json
+  updatedAt DateTime @updatedAt
+
+  game      Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+}
+
+model SeatReservation {
+  id        String   @id @default(cuid())
+  tableId   String
+  userId    String
+  seatId    String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  table     PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  seat      Seat       @relation(fields: [seatId], references: [id], onDelete: Cascade)
+
+  @@unique([tableId, userId])
+}
+
+model SittingOutPlayer {
+  id        String   @id @default(cuid())
+  tableId   String
+  userId    String
+  seatId    String   @unique
+  startedAt DateTime @default(now())
+
+  table     PokerTable @relation(fields: [tableId], references: [id], onDelete: Cascade)
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  seat      Seat       @relation(fields: [seatId], references: [id], onDelete: Cascade)
+
+  @@unique([tableId, userId])
 }

@@ -2,13 +2,18 @@ import http from 'http';
 import express from 'express';
 import cors from 'cors';
 import { Server } from 'socket.io';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 import { prisma } from './database/client';
-import { PokerGame } from './poker/PokerGame';
+import { PokerGame, userSocketMap } from './poker/PokerGame';
+import { ReconnectManager } from './services/ReconnectManager';
+import { ActionQueue } from './services/ActionQueue';
+import { SitOutManager } from './services/SitOutManager';
+import { logger } from './services/Logger';
+import { validateAction } from './lib/security';
+import { authMiddleware, adminMiddleware } from './middleware/auth';
+import { SecurityUtils } from './utils/security';
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+const PORT = Number(process.env.PORT) || 4001;
 
 app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
@@ -25,6 +30,10 @@ const io = new Server(server, {
 });
 
 console.log('🔧 Server starting...');
+
+// ============ GLOBAL INSTANCES ============
+const reconnectManager = ReconnectManager.getInstance();
+const actionQueue = new ActionQueue();
 
 // ============ BLIND LEVELS ============
 const BLIND_LEVELS = [
@@ -48,12 +57,10 @@ let botCounter = 0;
 // ============ AUTO-CREATE TABLES ============
 async function ensureTablesExist() {
   console.log('📋 Checking tables...');
-  
   for (const level of BLIND_LEVELS) {
     const existing = await prisma.pokerTable.findFirst({
       where: { smallBlind: level.smallBlind, bigBlind: level.bigBlind }
     });
-    
     if (!existing) {
       const table = await prisma.pokerTable.create({
         data: {
@@ -64,25 +71,192 @@ async function ensureTablesExist() {
           minBuyIn: level.minBuyIn,
           maxBuyIn: level.maxBuyIn,
           maxPlayers: 9,
-          status: 'waiting'
+          status: 'waiting',
+          dealerPosition: 0
         }
       });
-      
       for (let i = 0; i < 9; i++) {
         await prisma.seat.create({
-          data: {
-            tableId: table.id,
-            position: i,
-            stack: 0,
-            isSitting: false
-          }
+          data: { tableId: table.id, position: i, stack: 0, isSitting: false }
         });
       }
-      
       console.log(`✅ Created table: ${table.name}`);
     }
   }
   console.log('🎉 All tables initialized!');
+}
+
+// ============ STARTUP RECOVERY ============
+async function recoverOrphanedGames() {
+  console.log('[RECOVERY] Checking for orphaned games...');
+  const tables = await prisma.pokerTable.findMany({
+    where: {
+      status: 'playing',
+      currentGameId: { not: null }
+    }
+  });
+
+  for (const table of tables) {
+    const gameInMemory = activeGames.has(table.currentGameId!);
+    if (!gameInMemory) {
+      console.log(`[RECOVERY] Found orphaned game for table ${table.id} (${table.name}), gameId: ${table.currentGameId}`);
+      await prisma.pokerTable.update({
+        where: { id: table.id },
+        data: { status: 'waiting', currentGameId: null }
+      });
+      await prisma.game.updateMany({
+        where: { id: table.currentGameId! },
+        data: { status: 'finished', finishedAt: new Date() }
+      });
+      console.log(`[RECOVERY] Reset orphaned game for table ${table.id}`);
+    }
+  }
+  console.log('[RECOVERY] Orphaned game recovery complete.');
+}
+
+// ============ SERVER RESTART RECOVERY ============
+async function recoverGames() {
+  console.log('[RECOVER] Checking for games to restore...');
+  const pendingGames = await prisma.game.findMany({
+    where: { status: { not: 'finished' } }
+  });
+  for (const game of pendingGames) {
+    const state = await prisma.gameState.findUnique({ where: { gameId: game.id } });
+    if (state) {
+      const pokerGame = new PokerGame(game.id, game.tableId, game.smallBlind, game.bigBlind, io);
+      pokerGame.restoreState(state.state);
+      activeGames.set(game.id, pokerGame);
+      console.log(`[RECOVER] Restored game ${game.id}`);
+    } else {
+      await prisma.game.update({
+        where: { id: game.id },
+        data: { status: 'finished', finishedAt: new Date() }
+      });
+      console.log(`[RECOVER] Closed unfinished game ${game.id} (no saved state)`);
+    }
+  }
+  console.log('[RECOVER] Recovery complete.');
+}
+
+// ============ DISPOSE GAME ============
+async function disposeGame(tableId: string): Promise<void> {
+  let gameToRemove: PokerGame | null = null;
+  let gameIdToRemove: string | null = null;
+  for (const [id, game] of activeGames) {
+    if (game.getState().tableId === tableId) {
+      gameToRemove = game;
+      gameIdToRemove = id;
+      break;
+    }
+  }
+  if (gameToRemove && gameIdToRemove) {
+    gameToRemove.dispose();
+    activeGames.delete(gameIdToRemove);
+    console.log(`[DISPOSE] Removed game ${gameIdToRemove} for table ${tableId}`);
+  }
+}
+
+// ============ SHARED GAME-START FUNCTION ============
+async function startGameIfReady(tableId: string) {
+  console.log(`[GAME] 🔍 startGameIfReady called for table ${tableId}`);
+
+  const seatedCount = await prisma.seat.count({
+    where: { tableId, isSitting: true }
+  });
+  console.log(`[GAME] 👥 Seated players: ${seatedCount}`);
+
+  if (seatedCount < 2) {
+    console.log(`[GAME] ⏳ Not enough players (${seatedCount}/2). Waiting.`);
+    return;
+  }
+
+  const existingGame = await prisma.game.findFirst({
+    where: {
+      tableId: tableId,
+      status: { not: 'finished' }
+    },
+    orderBy: { createdAt: 'desc' }
+  });
+
+  if (existingGame) {
+    const gameInMemory = activeGames.has(existingGame.id);
+    if (!gameInMemory) {
+      console.log(`[GAME] ⚠️ Game exists in DB but not in memory. Resetting orphaned game.`);
+      await prisma.pokerTable.update({
+        where: { id: tableId },
+        data: {
+          status: 'waiting',
+          currentGameId: null
+        }
+      });
+      await prisma.game.update({
+        where: { id: existingGame.id },
+        data: { status: 'finished', finishedAt: new Date() }
+      });
+      console.log(`[GAME] Orphaned game reset. Proceeding to create a new game.`);
+    } else {
+      console.log(`[GAME] 🟢 Game already exists (${existingGame.id}) and is in memory.`);
+      const game = activeGames.get(existingGame.id);
+      if (game) {
+        const state = game.getState();
+        io.to(`table:${tableId}`).emit('game:state', state);
+        console.log(`[GAME] 📤 Existing game state sent.`);
+      }
+      return;
+    }
+  }
+
+  console.log(`[GAME] 🚀 Starting new game for table ${tableId} with ${seatedCount} players`);
+
+  const table = await prisma.pokerTable.findUnique({
+    where: { id: tableId },
+    include: { seats: { where: { isSitting: true } } }
+  });
+  if (!table) {
+    console.log(`[GAME] ❌ Table ${tableId} not found.`);
+    return;
+  }
+
+  const gameId = `game_${tableId}_${Date.now()}`;
+  console.log(`[GAME] 📝 Creating game record: ${gameId}`);
+
+  await prisma.game.create({
+    data: {
+      id: gameId,
+      tableId: tableId,
+      status: 'waiting',
+      smallBlind: table.smallBlind,
+      bigBlind: table.bigBlind,
+      dealerPosition: table.dealerPosition || 0,
+      currentPlayerPosition: 0
+    }
+  });
+
+  await prisma.pokerTable.update({
+    where: { id: tableId },
+    data: {
+      status: 'playing',
+      currentGameId: gameId
+    }
+  });
+  console.log(`[GAME] ✅ Table status updated to 'playing'`);
+
+  console.log(`[GAME] 🔧 Creating PokerGame instance...`);
+  const game = new PokerGame(gameId, tableId, table.smallBlind, table.bigBlind, io);
+  activeGames.set(gameId, game);
+  console.log(`[GAME] ✅ PokerGame instance created.`);
+
+  console.log(`[GAME] 🃏 Initializing PokerGame...`);
+  const gameState = await game.initGame();
+  console.log(`[GAME] ✅ Game initialized. Status: ${gameState.status}, Players: ${gameState.players.length}`);
+
+  console.log(`[GAME] 📤 Emitting game:started to table ${tableId}`);
+  io.to(`table:${tableId}`).emit('game:started', { gameId });
+
+  console.log(`[GAME] 📤 Emitting game:state to table ${tableId}`);
+  io.to(`table:${tableId}`).emit('game:state', gameState);
+
+  console.log(`[GAME] 🎉 Game started successfully!`);
 }
 
 // ============ AUTH ROUTES ============
@@ -92,11 +266,9 @@ app.post('/api/register', async (req, res) => {
     if (password.length < 8) {
       return res.status(400).json({ error: 'Password must be at least 8 characters' });
     }
-    
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) return res.status(400).json({ error: 'Email already registered' });
-    
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = SecurityUtils.hashPassword(password);
     const user = await prisma.user.create({
       data: {
         email,
@@ -106,8 +278,7 @@ app.post('/api/register', async (req, res) => {
       },
       include: { wallet: true }
     });
-    
-    const token = jwt.sign({ userId: user.id }, 'secret-key', { expiresIn: '7d' });
+    const token = SecurityUtils.generateToken(user.id);
     res.status(201).json({
       id: user.id,
       email: user.email,
@@ -116,8 +287,9 @@ app.post('/api/register', async (req, res) => {
       token
     });
   } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ error: 'Registration failed' });
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Register error:', errMsg);
+    res.status(500).json({ error: 'Registration failed', details: errMsg });
   }
 });
 
@@ -130,10 +302,10 @@ app.post('/api/login', async (req, res) => {
     });
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
     
-    const valid = await bcrypt.compare(password, user.password);
+    const valid = await SecurityUtils.comparePassword(password, user.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
     
-    const token = jwt.sign({ userId: user.id }, 'secret-key', { expiresIn: '7d' });
+    const token = SecurityUtils.generateToken(user.id);
     res.json({
       id: user.id,
       email: user.email,
@@ -142,14 +314,18 @@ app.post('/api/login', async (req, res) => {
       token
     });
   } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Login failed' });
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Login error:', errMsg);
+    res.status(500).json({ error: 'Login failed', details: errMsg });
   }
 });
 
 // ============ API ROUTES ============
+
+// ✅ PUBLIC: blinds (no auth required)
 app.get('/api/blinds', (req, res) => res.json(BLIND_LEVELS));
 
+// ✅ PUBLIC: tables list (no auth required)
 app.get('/api/tables', async (req, res) => {
   try {
     const tables = await prisma.pokerTable.findMany({
@@ -168,12 +344,14 @@ app.get('/api/tables', async (req, res) => {
     });
     res.json(tables);
   } catch (error) {
-    console.error('Tables error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Tables error:', errMsg);
     res.status(500).json({ error: 'Failed to fetch tables' });
   }
 });
 
-app.get('/api/tables/:tableId', async (req, res) => {
+// ---------- PROTECTED ROUTES (require auth) ----------
+app.get('/api/tables/:tableId', authMiddleware, async (req, res) => {
   try {
     const table = await prisma.pokerTable.findUnique({
       where: { id: req.params.tableId },
@@ -189,12 +367,13 @@ app.get('/api/tables/:tableId', async (req, res) => {
     if (!table) return res.status(404).json({ error: 'Table not found' });
     res.json(table);
   } catch (error) {
-    console.error('Table error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Table error:', errMsg);
     res.status(500).json({ error: 'Failed to fetch table' });
   }
 });
 
-app.get('/api/wallet/:userId', async (req, res) => {
+app.get('/api/wallet/:userId', authMiddleware, async (req, res) => {
   try {
     const wallet = await prisma.wallet.findUnique({
       where: { userId: req.params.userId }
@@ -206,29 +385,21 @@ app.get('/api/wallet/:userId', async (req, res) => {
       available: wallet.balance - wallet.locked
     });
   } catch (error) {
-    console.error('Wallet error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Wallet error:', errMsg);
     res.status(500).json({ error: 'Failed to get wallet' });
   }
 });
 
-app.get('/api/user/active-table/:userId', async (req, res) => {
+app.get('/api/user/active-table/:userId', authMiddleware, async (req, res) => {
   try {
     const { userId } = req.params;
-    
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
     const seat = await prisma.seat.findFirst({
-      where: {
-        userId: userId,
-        isSitting: true
-      },
-      include: {
-        table: true
-      }
+      where: { userId, isSitting: true },
+      include: { table: true }
     });
-    
-    if (!seat) {
-      return res.json({ hasActiveTable: false });
-    }
-    
+    if (!seat) return res.json({ hasActiveTable: false });
     res.json({
       hasActiveTable: true,
       tableId: seat.tableId,
@@ -236,13 +407,14 @@ app.get('/api/user/active-table/:userId', async (req, res) => {
       seat: seat
     });
   } catch (error) {
-    console.error('Active table check error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Active table check error:', errMsg);
     res.status(500).json({ error: 'Failed to check active table' });
   }
 });
 
 // ============ JOIN TABLE ============
-app.post('/api/table/join', async (req, res) => {
+app.post('/api/table/join', authMiddleware, async (req, res) => {
   console.log('========================================');
   console.log('🎯 [JOIN] Request received');
   console.log(`🎯 [JOIN] Body: ${JSON.stringify(req.body)}`);
@@ -250,12 +422,34 @@ app.post('/api/table/join', async (req, res) => {
   
   try {
     const { userId, tableId, buyInAmount, seatPosition } = req.body;
-    
     console.log(`🎯 [JOIN] User ${userId} joining table ${tableId} with buy-in ${buyInAmount}`);
     
     if (!userId || !tableId || !buyInAmount) {
       console.log('❌ [JOIN] Missing required fields');
       return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+    if (!user) {
+      console.log(`❌ [JOIN] User ${userId} not found`);
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    let wallet = await prisma.wallet.findUnique({
+      where: { userId: userId }
+    });
+
+    if (!wallet) {
+      console.log(`💰 [JOIN] No wallet found for user ${userId}, creating one...`);
+      wallet = await prisma.wallet.create({
+        data: {
+          userId: userId,
+          balance: 10000,
+          locked: 0
+        }
+      });
     }
 
     const existingSeat = await prisma.seat.findFirst({
@@ -283,13 +477,6 @@ app.post('/api/table/join', async (req, res) => {
       });
     }
 
-    const wallet = await prisma.wallet.findUnique({ where: { userId } });
-    if (!wallet) {
-      console.log(`❌ [JOIN] Wallet not found for user ${userId}`);
-      return res.status(400).json({ error: 'Wallet not found' });
-    }
-    console.log(`✅ [JOIN] Wallet balance: ${wallet.balance}`);
-    
     if (wallet.balance < buyInAmount) {
       console.log(`❌ [JOIN] Insufficient balance: ${wallet.balance} < ${buyInAmount}`);
       return res.status(400).json({ error: 'Insufficient balance' });
@@ -351,6 +538,10 @@ app.post('/api/table/join', async (req, res) => {
     });
     console.log(`👥 [JOIN] Now ${seatedCount} players seated at table ${tableId}`);
 
+    if (seatedCount === 0) {
+      await disposeGame(tableId);
+    }
+
     if (seatedCount >= table.maxPlayers) {
       console.log(`🔴 [JOIN] Table ${tableId} is now full!`);
       await prisma.pokerTable.update({
@@ -368,7 +559,6 @@ app.post('/api/table/join', async (req, res) => {
             bigBlind: table.bigBlind
           }
         });
-        
         const newTable = await prisma.pokerTable.create({
           data: {
             name: `${level.name} Table ${count + 1}`,
@@ -378,84 +568,20 @@ app.post('/api/table/join', async (req, res) => {
             minBuyIn: level.minBuyIn,
             maxBuyIn: level.maxBuyIn,
             maxPlayers: 9,
-            status: 'waiting'
+            status: 'waiting',
+            dealerPosition: 0
           }
         });
-        
         for (let i = 0; i < 9; i++) {
           await prisma.seat.create({
-            data: {
-              tableId: newTable.id,
-              position: i,
-              stack: 0,
-              isSitting: false
-            }
+            data: { tableId: newTable.id, position: i, stack: 0, isSitting: false }
           });
         }
         console.log(`🆕 [JOIN] Auto-created new table: ${newTable.name}`);
       }
     }
 
-    // ============ GAME CREATION ============
-    if (seatedCount >= 2) {
-      console.log(`🚀 [GAME] Checking if game already exists for table ${tableId}...`);
-      
-      const existingGame = await prisma.game.findFirst({
-        where: {
-          tableId: tableId,
-          status: { not: 'finished' }
-        },
-        orderBy: { createdAt: 'desc' }
-      });
-
-      if (!existingGame) {
-        console.log(`🚀 [GAME] No existing game found. Starting new game for table ${tableId} with ${seatedCount} players`);
-        
-        const gameId = `game_${tableId}_${Date.now()}`;
-        console.log(`📝 [GAME] Creating game record with ID: ${gameId}`);
-        
-        await prisma.game.create({
-          data: {
-            id: gameId,
-            tableId: tableId,
-            status: 'waiting',
-            smallBlind: table.smallBlind,
-            bigBlind: table.bigBlind,
-            dealerPosition: 0,
-            currentPlayerPosition: 0
-          }
-        });
-
-        console.log(`🔧 [GAME] Creating PokerGame instance...`);
-        const game = new PokerGame(gameId, tableId, table.smallBlind, table.bigBlind, io);
-        activeGames.set(gameId, game);
-        console.log(`✅ [GAME] PokerGame instance created and stored in activeGames (${activeGames.size} total games)`);
-        
-        console.log(`🚀 [GAME] Initializing game...`);
-        const gameState = await game.initGame();
-        console.log(`✅ [GAME] Game initialized with status: ${gameState.status}`);
-        console.log(`   Players: ${gameState.players.length}`);
-        console.log(`   Pot: ${gameState.pot}`);
-        
-        console.log(`📤 [GAME] Broadcasting game:started to table ${tableId}...`);
-        io.to(`table:${tableId}`).emit('game:started', { gameId });
-        
-        console.log(`📤 [GAME] Broadcasting game:state to table ${tableId}...`);
-        io.to(`table:${tableId}`).emit('game:state', gameState);
-        
-        console.log(`✅ [GAME] Game state broadcast complete!`);
-      } else {
-        console.log(`✅ [GAME] Game already exists for table ${tableId}. Not starting a new one.`);
-        const game = activeGames.get(existingGame.id);
-        if (game) {
-          const state = game.getState();
-          io.to(`table:${tableId}`).emit('game:state', state);
-          console.log(`📤 [GAME] Existing game state sent to table ${tableId}`);
-        }
-      }
-    } else {
-      console.log(`⏳ [GAME] Only ${seatedCount} player(s). Need 2 to start.`);
-    }
+    await startGameIfReady(tableId);
 
     io.emit('table:updated', { tableId });
 
@@ -481,26 +607,34 @@ app.post('/api/table/join', async (req, res) => {
       message: `Joined table with ₹${buyInAmount} buy-in`
     });
   } catch (error) {
-    console.error('❌ [JOIN] Error:', error);
-    console.error('❌ [JOIN] Stack:', error.stack);
-    res.status(500).json({ error: 'Failed to join table', details: String(error) });
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('❌ [JOIN] Error:', errMsg);
+    console.error('❌ [JOIN] Stack:', error instanceof Error ? error.stack : '');
+    res.status(500).json({ error: 'Failed to join table', details: errMsg });
   }
 });
 
-// ============ LEAVE ROUTE ============
-app.post('/api/table/leave', async (req, res) => {
+// ============ LEAVE TABLE ============
+app.post('/api/table/leave', authMiddleware, async (req, res) => {
   try {
     const { userId, inHand } = req.body;
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
     const seat = await prisma.seat.findFirst({
       where: { userId, isSitting: true }
     });
     if (!seat) return res.status(404).json({ error: 'Not at any table' });
 
     if (!inHand) {
-      const wallet = await prisma.wallet.findUnique({ where: { userId } });
+      if (typeof seat.userId !== 'string') {
+        return res.status(400).json({ error: 'Invalid seat: no user attached' });
+      }
+
+      const wallet = await prisma.wallet.findUnique({
+        where: { userId: seat.userId }
+      });
       if (wallet) {
         await prisma.wallet.update({
-          where: { userId },
+          where: { userId: seat.userId },
           data: {
             balance: wallet.balance + seat.stack,
             locked: wallet.locked - seat.stack
@@ -530,6 +664,17 @@ app.post('/api/table/leave', async (req, res) => {
         }
       });
 
+      const seatedCount = await prisma.seat.count({
+        where: { tableId: seat.tableId, isSitting: true }
+      });
+      if (seatedCount < 2) {
+        await disposeGame(seat.tableId);
+        await prisma.pokerTable.update({
+          where: { id: seat.tableId },
+          data: { status: 'waiting' }
+        });
+      }
+
       const nextInLine = await prisma.waitingList.findFirst({
         where: { tableId: seat.tableId },
         orderBy: { position: 'asc' }
@@ -556,29 +701,22 @@ app.post('/api/table/leave', async (req, res) => {
       });
     }
   } catch (error) {
-    console.error('Leave table error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Leave table error:', errMsg);
     res.status(500).json({ error: 'Failed to leave table' });
   }
 });
 
-app.post('/api/table/buy-more', async (req, res) => {
+// ============ BUY MORE ============
+app.post('/api/table/buy-more', authMiddleware, async (req, res) => {
   try {
     const { userId, tableId, amount } = req.body;
-    
-    const seat = await prisma.seat.findFirst({
-      where: { userId, tableId, isSitting: true }
-    });
-    if (!seat) return res.status(404).json({ error: 'Not at table' });
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
 
-    const table = await prisma.pokerTable.findUnique({
-      where: { id: tableId }
-    });
+    const table = await prisma.pokerTable.findUnique({ where: { id: tableId } });
     if (!table) return res.status(404).json({ error: 'Table not found' });
-
     if (amount < table.minBuyIn || amount > table.maxBuyIn) {
-      return res.status(400).json({
-        error: `Amount must be between ₹${table.minBuyIn} and ₹${table.maxBuyIn}`
-      });
+      return res.status(400).json({ error: `Amount must be between ₹${table.minBuyIn} and ₹${table.maxBuyIn}` });
     }
 
     const wallet = await prisma.wallet.findUnique({ where: { userId } });
@@ -586,92 +724,77 @@ app.post('/api/table/buy-more', async (req, res) => {
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    await prisma.wallet.update({
-      where: { userId },
-      data: {
-        balance: wallet.balance - amount,
-        locked: wallet.locked + amount
-      }
-    });
+    const seat = await prisma.seat.findFirst({ where: { userId, tableId, isSitting: true } });
+    if (!seat) return res.status(404).json({ error: 'Not at table' });
 
-    await prisma.walletTransaction.create({
-      data: {
-        walletId: wallet.id,
-        amount: -amount,
-        balance: wallet.balance - amount,
-        type: 'REBUY',
-        referenceId: tableId,
-        description: `Rebuy at ${table.name}`
-      }
-    });
+    await prisma.$transaction([
+      prisma.wallet.update({
+        where: { userId },
+        data: { balance: { decrement: amount }, locked: { increment: amount } }
+      }),
+      prisma.seat.update({
+        where: { id: seat.id },
+        data: { stack: { increment: amount } }
+      }),
+      prisma.walletTransaction.create({
+        data: {
+          walletId: wallet.id,
+          amount: -amount,
+          balance: wallet.balance - amount,
+          type: 'REBUY',
+          referenceId: tableId,
+          description: `Rebuy at ${table.name}`
+        }
+      })
+    ]);
 
-    const updatedSeat = await prisma.seat.update({
-      where: { id: seat.id },
-      data: {
-        stack: seat.stack + amount
-      }
-    });
-
-    io.to(`table:${tableId}`).emit('player:updated', {
-      userId,
-      stack: updatedSeat.stack
-    });
-
-    res.json({
-      success: true,
-      newStack: updatedSeat.stack,
-      message: `Added ₹${amount} to your stack`
-    });
+    res.json({ success: true, newStack: seat.stack + amount });
   } catch (error) {
-    console.error('Buy more error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Buy more error:', errMsg);
     res.status(500).json({ error: 'Failed to add chips' });
   }
 });
 
-app.post('/api/table/sit-out', async (req, res) => {
+// ============ SIT OUT ============
+app.post('/api/table/sit-out', authMiddleware, async (req, res) => {
   try {
     const { userId, tableId } = req.body;
-    
-    const seat = await prisma.seat.findFirst({
-      where: {
-        userId: userId,
-        tableId: tableId,
-        isSitting: true
-      }
-    });
-    
-    if (!seat) {
-      return res.status(404).json({ error: 'Seat not found' });
-    }
-    
-    await prisma.seat.update({
-      where: { id: seat.id },
-      data: { isSitOut: true }
-    });
-    
-    io.to(`table:${tableId}`).emit('player:sitout', { userId });
-    
-    res.json({ success: true, message: 'Sitting out' });
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
+    await SitOutManager.sitOut(userId, tableId);
+    res.json({ success: true });
   } catch (error) {
-    console.error('Sit out error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Sit out error:', errMsg);
     res.status(500).json({ error: 'Failed to sit out' });
   }
 });
 
-app.post('/api/table/waiting', async (req, res) => {
+app.post('/api/table/back', authMiddleware, async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
+    await SitOutManager.returnToGame(userId);
+    res.json({ success: true });
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Sit out return error:', errMsg);
+    res.status(500).json({ error: 'Failed to return to game' });
+  }
+});
+
+// ============ WAITING LIST ============
+app.post('/api/table/waiting', authMiddleware, async (req, res) => {
   try {
     const { tableId, userId } = req.body;
-    
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
     const existing = await prisma.waitingList.findFirst({
       where: { tableId, userId }
     });
-    
     if (existing) {
       return res.json({ success: true, message: 'Already on waiting list' });
     }
-    
     const count = await prisma.waitingList.count({ where: { tableId } });
-    
     await prisma.waitingList.create({
       data: {
         tableId,
@@ -679,15 +802,15 @@ app.post('/api/table/waiting', async (req, res) => {
         position: count + 1
       }
     });
-    
     res.json({ success: true, message: 'Added to waiting list' });
   } catch (error) {
-    console.error('Waiting list error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Waiting list error:', errMsg);
     res.status(500).json({ error: 'Failed to join waiting list' });
   }
 });
 
-// ============ BOT ROUTES ============
+// ============ BOT ROUTE ============
 app.post('/api/dev/add-bots', async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
     return res.status(403).json({ error: 'Bot mode disabled in production' });
@@ -695,21 +818,16 @@ app.post('/api/dev/add-bots', async (req, res) => {
 
   try {
     const { tableId, count = 1, buyInAmount } = req.body;
-    
     console.log(`🤖 [BOTS] Adding ${count} bot(s) to table ${tableId}`);
-    console.log(`🤖 [BOTS] Current active games: ${Array.from(activeGames.keys()).join(', ')}`);
     
     const table = await prisma.pokerTable.findUnique({
       where: { id: tableId },
       include: { seats: true }
     });
-    
     if (!table) {
       console.log('❌ [BOTS] Table not found');
       return res.status(404).json({ error: 'Table not found' });
     }
-
-    console.log(`📊 [BOTS] Table ${tableId} has ${table.seats.filter(s => s.isSitting).length} players already seated`);
 
     const botsAdded = [];
     const seatsAdded = [];
@@ -758,81 +876,18 @@ app.post('/api/dev/add-bots', async (req, res) => {
 
       botsAdded.push(botUser);
       seatsAdded.push(seat);
-      
       console.log(`🤖 [BOTS] Added ${botName} to seat ${seat.position}`);
     }
+
+    console.log(`🤖 [BOTS] About to call startGameIfReady for table ${tableId}`);
+    await startGameIfReady(tableId);
+    console.log(`🤖 [BOTS] startGameIfReady completed.`);
+
+    io.emit('table:updated', { tableId });
 
     const seatedCount = await prisma.seat.count({
       where: { tableId, isSitting: true }
     });
-
-    console.log(`👥 [BOTS] Now ${seatedCount} players seated at table ${tableId}`);
-    console.log(`👥 [BOTS] seatedCount >= 2? ${seatedCount >= 2}`);
-
-    // ============ GAME CREATION FOR BOTS ============
-    if (seatedCount >= 2) {
-      console.log(`🚀 [BOTS] Checking if game already exists for table ${tableId}...`);
-      
-      const existingGame = await prisma.game.findFirst({
-        where: {
-          tableId: tableId,
-          status: { not: 'finished' }
-        },
-        orderBy: { createdAt: 'desc' }
-      });
-
-      if (existingGame) {
-        console.log(`✅ [BOTS] Game already exists: ${existingGame.id}`);
-        // Send existing game state
-        const game = activeGames.get(existingGame.id);
-        if (game) {
-          const state = game.getState();
-          io.to(`table:${tableId}`).emit('game:state', state);
-          console.log(`📤 [BOTS] Existing game state sent to table ${tableId}`);
-        } else {
-          console.log(`❌ [BOTS] Game ${existingGame.id} not in memory!`);
-        }
-      } else {
-        console.log(`🚀 [BOTS] No existing game found. Starting new game for table ${tableId} with ${seatedCount} players`);
-        
-        const gameId = `game_${tableId}_${Date.now()}`;
-        console.log(`📝 [BOTS] Creating game record with ID: ${gameId}`);
-        
-        await prisma.game.create({
-          data: {
-            id: gameId,
-            tableId: tableId,
-            status: 'waiting',
-            smallBlind: table.smallBlind,
-            bigBlind: table.bigBlind,
-            dealerPosition: 0,
-            currentPlayerPosition: 0
-          }
-        });
-
-        console.log(`🔧 [BOTS] Creating PokerGame instance...`);
-        const game = new PokerGame(gameId, tableId, table.smallBlind, table.bigBlind, io);
-        activeGames.set(gameId, game);
-        console.log(`✅ [BOTS] PokerGame instance created. Total active games: ${activeGames.size}`);
-        
-        console.log(`🚀 [BOTS] Calling game.initGame()...`);
-        const gameState = await game.initGame();
-        console.log(`✅ [BOTS] Game initialized with status: ${gameState.status}`);
-        console.log(`   Players in game: ${gameState.players.length}`);
-        console.log(`   Pot: ${gameState.pot}`);
-        
-        console.log(`📤 [BOTS] Broadcasting game:started to table ${tableId}...`);
-        io.to(`table:${tableId}`).emit('game:started', { gameId });
-        
-        console.log(`📤 [BOTS] Broadcasting game:state to table ${tableId}...`);
-        io.to(`table:${tableId}`).emit('game:state', gameState);
-        console.log(`✅ [BOTS] Game state broadcast complete!`);
-      }
-    } else {
-      console.log(`⏳ [BOTS] Only ${seatedCount} player(s). Need 2 to start.`);
-    }
-
-    io.emit('table:updated', { tableId });
 
     res.json({
       success: true,
@@ -842,12 +897,13 @@ app.post('/api/dev/add-bots', async (req, res) => {
       seats: seatsAdded.map(s => ({ position: s.position, stack: s.stack }))
     });
   } catch (error) {
-    console.error('❌ [BOTS] Error:', error);
-    console.error('❌ [BOTS] Stack:', error.stack);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('❌ [BOTS] Error:', errMsg);
     res.status(500).json({ error: String(error) });
   }
 });
 
+// ============ CLEAR BOTS ============
 app.post('/api/dev/clear-bots', async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
     return res.status(403).json({ error: 'Bot mode disabled in production' });
@@ -857,15 +913,14 @@ app.post('/api/dev/clear-bots', async (req, res) => {
     const { tableId } = req.body;
     
     const seats = await prisma.seat.findMany({
-      where: { 
-        tableId, 
-        isSitting: true 
-      },
+      where: { tableId, isSitting: true },
       include: { user: true }
     });
 
     for (const seat of seats) {
       if (seat.user?.email?.includes('@poker.local')) {
+        if (!seat.userId) continue;
+
         const wallet = await prisma.wallet.findUnique({
           where: { userId: seat.userId }
         });
@@ -896,131 +951,28 @@ app.post('/api/dev/clear-bots', async (req, res) => {
       }
     }
 
+    const seatedCount = await prisma.seat.count({
+      where: { tableId, isSitting: true }
+    });
+    if (seatedCount < 2) {
+      await disposeGame(tableId);
+      await prisma.pokerTable.update({
+        where: { id: tableId },
+        data: { status: 'waiting' }
+      });
+    }
+
     io.emit('table:updated', { tableId });
 
     res.json({ success: true, message: 'Bots removed' });
   } catch (error) {
-    console.error('❌ [BOTS] Clear error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('❌ [BOTS] Clear error:', errMsg);
     res.status(500).json({ error: String(error) });
   }
 });
 
-// ============ DIAGNOSTIC ROUTE ============
-app.get('/api/diagnostic/:tableId', async (req, res) => {
-  try {
-    const table = await prisma.pokerTable.findUnique({
-      where: { id: req.params.tableId },
-      include: {
-        seats: {
-          include: { user: true }
-        },
-        games: {
-          orderBy: { createdAt: 'desc' },
-          take: 5,
-          include: {
-            players: true,
-            actions: {
-              orderBy: { timestamp: 'asc' },
-              take: 20
-            }
-          }
-        }
-      }
-    });
-    
-    res.json({
-      table: {
-        id: table.id,
-        name: table.name,
-        status: table.status,
-        seatedPlayers: table.seats?.filter(s => s.isSitting).length || 0,
-        maxPlayers: table.maxPlayers,
-        seats: table.seats?.map(s => ({
-          position: s.position,
-          userId: s.userId,
-          isSitting: s.isSitting,
-          stack: s.stack,
-          isSitOut: s.isSitOut
-        }))
-      },
-      games: table.games?.map(g => ({
-        id: g.id,
-        status: g.status,
-        pot: g.pot,
-        players: g.players?.length || 0,
-        createdAt: g.createdAt
-      })),
-      activeGamesInMemory: Array.from(activeGames.keys())
-    });
-  } catch (error) {
-    res.status(500).json({ error: String(error) });
-  }
-});
-
-// ============ SOCKET.IO ============
-io.on('connection', (socket) => {
-  console.log(`🟢 [SOCKET] Player connected: ${socket.id}`);
-
-  socket.on('join:table', (tableId) => {
-    socket.join(`table:${tableId}`);
-    console.log(`✅ [SOCKET] Socket ${socket.id} joined room table:${tableId}`);
-    console.log(`📊 [SOCKET] Rooms: ${Array.from(socket.rooms).join(', ')}`);
-  });
-
-  socket.on('leave:table', (tableId) => {
-    socket.leave(`table:${tableId}`);
-    console.log(`❌ [SOCKET] Socket ${socket.id} left room table:${tableId}`);
-  });
-
-  socket.on('request:game:state', (data) => {
-    console.log(`📊 [SOCKET] Requesting game state for ${data.gameId}`);
-    const game = activeGames.get(data.gameId);
-    if (game) {
-      const state = game.getState();
-      socket.emit('game:state', state);
-      console.log(`✅ [SOCKET] Game state sent to ${socket.id}`);
-    } else {
-      console.log(`❌ [SOCKET] Game ${data.gameId} not found in activeGames`);
-      console.log(`📊 [SOCKET] Active games: ${Array.from(activeGames.keys()).join(', ')}`);
-    }
-  });
-
-  socket.on('game:action', async (data) => {
-    try {
-      console.log(`🎮 [SOCKET] Action: ${data.action} by ${data.userId} on ${data.gameId}`);
-      const { gameId, userId, action, amount } = data;
-      const game = activeGames.get(gameId);
-      if (game) {
-        const result = await game.processAction(userId, action, amount);
-        io.to(`table:${gameId}`).emit('game:state', result);
-        console.log(`✅ [SOCKET] Action processed and state broadcast`);
-      } else {
-        console.log(`❌ [SOCKET] Game ${gameId} not found`);
-      }
-    } catch (error) {
-      console.error('❌ [SOCKET] Game action error:', error);
-      socket.emit('game:error', { message: String(error) });
-    }
-  });
-
-  socket.on('disconnect', () => {
-    console.log(`🔴 [SOCKET] Player disconnected: ${socket.id}`);
-  });
-});
-
-// ============ START SERVER ============
-ensureTablesExist().then(() => {
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`✅ WebSocket server ready`);
-  });
-});
-
-export { server, io };
-
-// ============ DEVELOPMENT RESET ENDPOINTS ============
-
-// Reset player state - removes player from any active table
+// ============ RESET PLAYER ============
 app.post('/api/dev/reset-player', async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
     return res.status(403).json({ error: 'Reset mode disabled in production' });
@@ -1028,9 +980,9 @@ app.post('/api/dev/reset-player', async (req, res) => {
 
   try {
     const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'User ID missing' });
     console.log(`🔧 [DEV] Resetting player ${userId}`);
     
-    // Find if player is at any table
     const seat = await prisma.seat.findFirst({
       where: { userId, isSitting: true },
       include: { table: true }
@@ -1043,7 +995,6 @@ app.post('/api/dev/reset-player', async (req, res) => {
 
     console.log(`🔧 [DEV] Found player at table ${seat.tableId} seat ${seat.position}`);
 
-    // Return chips to wallet
     const wallet = await prisma.wallet.findUnique({
       where: { userId }
     });
@@ -1071,7 +1022,6 @@ app.post('/api/dev/reset-player', async (req, res) => {
       console.log(`🔧 [DEV] Returned ${seat.stack} chips to wallet`);
     }
 
-    // Remove from seat
     await prisma.seat.update({
       where: { id: seat.id },
       data: {
@@ -1086,22 +1036,15 @@ app.post('/api/dev/reset-player', async (req, res) => {
 
     console.log(`🔧 [DEV] Player removed from seat`);
 
-    // Check if any games need to be cleaned up
-    const game = await prisma.game.findFirst({
-      where: {
-        tableId: seat.tableId,
-        status: { not: 'finished' }
-      },
-      orderBy: { createdAt: 'desc' }
+    const seatedCount = await prisma.seat.count({
+      where: { tableId: seat.tableId, isSitting: true }
     });
-
-    if (game) {
-      console.log(`🔧 [DEV] Active game found: ${game.id}`);
-      // Remove from memory if exists
-      if (activeGames.has(game.id)) {
-        activeGames.delete(game.id);
-        console.log(`🔧 [DEV] Removed game from memory`);
-      }
+    if (seatedCount < 2) {
+      await disposeGame(seat.tableId);
+      await prisma.pokerTable.update({
+        where: { id: seat.tableId },
+        data: { status: 'waiting' }
+      });
     }
 
     io.emit('table:updated', { tableId: seat.tableId });
@@ -1113,12 +1056,13 @@ app.post('/api/dev/reset-player', async (req, res) => {
       tableId: seat.tableId
     });
   } catch (error) {
-    console.error('❌ [DEV] Reset error:', error);
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('❌ [DEV] Reset error:', errMsg);
     res.status(500).json({ error: String(error) });
   }
 });
 
-// Reset entire table - removes all players and bots
+// ============ RESET TABLE ============
 app.post('/api/dev/reset-table', async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
     return res.status(403).json({ error: 'Reset mode disabled in production' });
@@ -1127,124 +1071,387 @@ app.post('/api/dev/reset-table', async (req, res) => {
   try {
     const { tableId } = req.body;
     console.log(`🔧 [DEV] Resetting table ${tableId}`);
-    
-    // Get all occupied seats
-    const seats = await prisma.seat.findMany({
-      where: { tableId, isSitting: true },
-      include: { user: true }
-    });
 
-    console.log(`🔧 [DEV] Found ${seats.length} occupied seats`);
+    await disposeGame(tableId);
 
-    for (const seat of seats) {
-      if (seat.userId) {
-        // Return chips to wallet
-        const wallet = await prisma.wallet.findUnique({
-          where: { userId: seat.userId }
-        });
-
-        if (wallet) {
-          await prisma.wallet.update({
-            where: { userId: seat.userId },
-            data: {
-              balance: wallet.balance + seat.stack,
-              locked: wallet.locked - seat.stack
-            }
-          });
-        }
-
-        // Remove from seat
-        await prisma.seat.update({
-          where: { id: seat.id },
-          data: {
-            userId: null,
-            stack: 0,
-            isSitting: false,
-            isSitOut: false,
-            reservedAt: null,
-            reservedFor: null
-          }
-        });
-
-        // If bot, delete user
-        if (seat.user?.email?.includes('@poker.local')) {
-          await prisma.user.delete({
-            where: { id: seat.userId }
-          });
-          console.log(`🔧 [DEV] Deleted bot user: ${seat.user.email}`);
-        }
-      }
-    }
-
-    // End any active games
-    const game = await prisma.game.findFirst({
-      where: {
-        tableId: tableId,
-        status: { not: 'finished' }
-      },
-      orderBy: { createdAt: 'desc' }
-    });
-
-    if (game) {
-      await prisma.game.update({
-        where: { id: game.id },
-        data: { status: 'finished', finishedAt: new Date() }
-      });
-      
-      if (activeGames.has(game.id)) {
-        activeGames.delete(game.id);
-      }
-      console.log(`🔧 [DEV] Ended game: ${game.id}`);
-    }
-
-    // Reset table status
-    await prisma.pokerTable.update({
+    const table = await prisma.pokerTable.findUnique({
       where: { id: tableId },
-      data: { status: 'waiting' }
+      include: {
+        seats: {
+          where: { isSitting: true },
+          include: { user: true }
+        }
+      }
+    });
+
+    if (!table) {
+      return res.status(404).json({ error: 'Table not found' });
+    }
+
+    const botUsers = table.seats
+      .filter(seat => seat.user?.email?.includes('@poker.local') && seat.userId !== null)
+      .map(seat => seat.user!);
+    const botUserIds = botUsers.map(u => u.id);
+
+    const botWallets = await prisma.wallet.findMany({
+      where: { userId: { in: botUserIds } }
+    });
+    const botWalletIds = botWallets.map(w => w.id);
+
+    const allGames = await prisma.game.findMany({
+      where: { tableId: tableId },
+      select: { id: true }
+    });
+    const allGameIds = allGames.map(g => g.id);
+
+    await prisma.$transaction(async (tx) => {
+      if (botUserIds.length > 0) {
+        await tx.gamePlayer.deleteMany({
+          where: { userId: { in: botUserIds } }
+        });
+        console.log(`🔧 [DEV] Deleted GamePlayers for bots`);
+      }
+
+      if (allGameIds.length > 0) {
+        await tx.gamePlayer.deleteMany({
+          where: { gameId: { in: allGameIds } }
+        });
+        console.log(`🔧 [DEV] Deleted GamePlayers for all games on table`);
+      }
+
+      if (allGameIds.length > 0) {
+        await tx.game.deleteMany({
+          where: { id: { in: allGameIds } }
+        });
+        console.log(`🔧 [DEV] Deleted games ${allGameIds.join(', ')}`);
+      }
+
+      await tx.seat.updateMany({
+        where: { tableId: tableId },
+        data: {
+          userId: null,
+          stack: 0,
+          isSitting: false,
+          isSitOut: false,
+          reservedAt: null,
+          reservedFor: null
+        }
+      });
+      console.log(`🔧 [DEV] Reset all seats for table ${tableId}`);
+
+      if (botWalletIds.length > 0) {
+        await tx.walletTransaction.deleteMany({
+          where: { walletId: { in: botWalletIds } }
+        });
+        console.log(`🔧 [DEV] Deleted WalletTransactions for bots`);
+      }
+
+      if (botUserIds.length > 0) {
+        await tx.wallet.deleteMany({
+          where: { userId: { in: botUserIds } }
+        });
+        console.log(`🔧 [DEV] Deleted Wallets for bots`);
+      }
+
+      if (botUserIds.length > 0) {
+        await tx.user.deleteMany({
+          where: { id: { in: botUserIds } }
+        });
+        console.log(`🔧 [DEV] Deleted bot users ${botUserIds.join(', ')}`);
+      }
+
+      await tx.pokerTable.update({
+        where: { id: tableId },
+        data: {
+          status: 'waiting',
+          currentGameId: null
+        }
+      });
+      console.log(`🔧 [DEV] Table ${tableId} set to waiting`);
+
+      await tx.waitingList.deleteMany({
+        where: { tableId: tableId }
+      });
     });
 
     io.emit('table:updated', { tableId });
 
     console.log(`✅ [DEV] Table ${tableId} reset successfully`);
-    res.json({
-      success: true,
-      message: 'Table reset successfully'
-    });
+    res.json({ success: true, message: 'Table reset successfully' });
+
   } catch (error) {
-    console.error('❌ [DEV] Reset table error:', error);
-    res.status(500).json({ error: String(error) });
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('❌ [DEV] Reset table error:', errMsg);
+    res.status(500).json({ error: errMsg });
   }
 });
 
-// Get player status - check if player is at a table
-app.get('/api/dev/player-status/:userId', async (req, res) => {
-  if (process.env.NODE_ENV === 'production') {
-    return res.status(403).json({ error: 'Dev mode disabled in production' });
-  }
-
+// ============ DIAGNOSTIC ROUTE ============
+app.get('/api/diagnostic/:tableId', authMiddleware, async (req, res) => {
   try {
-    const { userId } = req.params;
-    
-    const seat = await prisma.seat.findFirst({
-      where: { userId, isSitting: true },
-      include: { table: true }
+    const table = await prisma.pokerTable.findUnique({
+      where: { id: req.params.tableId },
+      include: {
+        seats: {
+          include: { user: true }
+        },
+        games: {
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+          include: {
+            players: true,
+            actions: {
+              orderBy: { timestamp: 'asc' },
+              take: 20
+            }
+          }
+        }
+      }
     });
-
-    if (!seat) {
-      return res.json({
-        isSeated: false,
-        message: 'Player is not at any table'
-      });
-    }
+    
+    if (!table) return res.status(404).json({ error: 'Table not found' });
 
     res.json({
-      isSeated: true,
-      tableId: seat.tableId,
-      tableName: seat.table.name,
-      position: seat.position,
-      stack: seat.stack
+      table: {
+        id: table.id,
+        name: table.name,
+        status: table.status,
+        seatedPlayers: table.seats?.filter(s => s.isSitting).length || 0,
+        maxPlayers: table.maxPlayers,
+        seats: table.seats?.map(s => ({
+          position: s.position,
+          userId: s.userId,
+          isSitting: s.isSitting,
+          stack: s.stack,
+          isSitOut: s.isSitOut
+        }))
+      },
+      games: table.games?.map(g => ({
+        id: g.id,
+        status: g.status,
+        pot: g.pot,
+        players: g.players?.length || 0,
+        createdAt: g.createdAt
+      })),
+      activeGamesInMemory: Array.from(activeGames.keys())
     });
   } catch (error) {
-    res.status(500).json({ error: String(error) });
+    const errMsg = error instanceof Error ? error.message : String(error);
+    res.status(500).json({ error: errMsg });
   }
 });
+
+// ============ ADMIN ROUTES ============
+app.get('/api/admin/games', adminMiddleware, (req, res) => {
+  res.json(Array.from(activeGames.keys()));
+});
+
+app.get('/api/admin/health', adminMiddleware, (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), games: activeGames.size });
+});
+
+app.post('/api/admin/kick-player', adminMiddleware, async (req, res) => {
+  const { userId, tableId } = req.body;
+  // implement kick logic
+  res.json({ success: true });
+});
+
+app.post('/api/admin/reset-table', adminMiddleware, async (req, res) => {
+  const { tableId } = req.body;
+  try {
+    await disposeGame(tableId);
+    await prisma.seat.updateMany({
+      where: { tableId },
+      data: { userId: null, stack: 0, isSitting: false }
+    });
+    await prisma.pokerTable.update({
+      where: { id: tableId },
+      data: { status: 'waiting', currentGameId: null }
+    });
+    io.emit('table:updated', { tableId });
+    res.json({ success: true });
+  } catch (error) {
+    const errMsg = error instanceof Error ? error.message : String(error);
+    console.error('Admin reset error:', errMsg);
+    res.status(500).json({ error: errMsg });
+  }
+});
+
+app.post('/api/admin/pause-game', adminMiddleware, (req, res) => {
+  res.json({ success: true });
+});
+
+app.post('/api/admin/resume-game', adminMiddleware, (req, res) => {
+  res.json({ success: true });
+});
+
+app.post('/api/admin/force-next-hand', adminMiddleware, (req, res) => {
+  res.json({ success: true });
+});
+
+app.get('/api/admin/logs', adminMiddleware, (req, res) => {
+  res.json({ logs: [] });
+});
+
+app.get('/api/admin/tables', adminMiddleware, async (req, res) => {
+  const tables = await prisma.pokerTable.findMany({ include: { seats: true } });
+  res.json(tables);
+});
+
+app.get('/api/admin/sockets', adminMiddleware, (req, res) => {
+  res.json({ sockets: [] });
+});
+
+// ============ HELPER: SEND TABLE STATE ============
+async function sendTableState(socket: any, tableId: string) {
+  let gameState = null;
+  for (const [gameId, game] of activeGames) {
+    if (game.getState().tableId === tableId) {
+      gameState = game.getState();
+      break;
+    }
+  }
+
+  if (gameState) {
+    socket.emit('game:state', gameState);
+  } else {
+    const table = await prisma.pokerTable.findUnique({
+      where: { id: tableId },
+      include: { seats: { where: { isSitting: true } } }
+    });
+    const seatedCount = table?.seats?.length || 0;
+    socket.emit('game:state', {
+      status: 'waiting',
+      players: [],
+      pot: 0,
+      communityCards: [],
+      currentBet: 0,
+      seatedPlayers: seatedCount,
+      tableId: tableId,
+    });
+  }
+}
+
+// ============ SOCKET.IO ============
+io.on('connection', (socket) => {
+  console.log(`🟢 [SOCKET] Player connected: ${socket.id}`);
+
+  socket.on('set:userId', (userId) => {
+    if (userId) {
+      userSocketMap.set(userId, socket.id);
+      socket.data.userId = userId;
+      console.log(`✅ [SOCKET] Mapped user ${userId} to socket ${socket.id}`);
+    }
+  });
+
+  socket.on('join:table', (data) => {
+    let tableId: string;
+    let userId: string | undefined;
+    if (typeof data === 'string') {
+      tableId = data;
+    } else if (data && typeof data === 'object') {
+      tableId = data.tableId;
+      userId = data.userId;
+      if (userId) {
+        userSocketMap.set(userId, socket.id);
+        socket.data.userId = userId;
+        console.log(`✅ [SOCKET] Mapped user ${userId} to socket ${socket.id} via join:table`);
+      }
+    } else {
+      return;
+    }
+    socket.join(`table:${tableId}`);
+    console.log(`✅ [SOCKET] Socket ${socket.id} joined room table:${tableId}`);
+    console.log(`📊 [SOCKET] Rooms: ${Array.from(socket.rooms).join(', ')}`);
+
+    sendTableState(socket, tableId);
+  });
+
+  socket.on('leave:table', (tableId) => {
+    socket.leave(`table:${tableId}`);
+    console.log(`❌ [SOCKET] Socket ${socket.id} left room table:${tableId}`);
+  });
+
+  socket.on('request:game:state', (data) => {
+    console.log(`📊 [SOCKET] Requesting game state for ${data.gameId}`);
+    const game = activeGames.get(data.gameId);
+    if (game) {
+      socket.emit('game:state', game.getState());
+    } else {
+      const tableId = data.tableId || Array.from(socket.rooms).find(r => r.startsWith('table:'))?.replace('table:', '');
+      if (tableId) {
+        sendTableState(socket, tableId);
+      } else {
+        socket.emit('game:error', { message: 'No table found for game state request' });
+      }
+    }
+  });
+
+  // ---------- ACTION HANDLER ----------
+  socket.on('game:action', async (data) => {
+    if (!validateAction(socket, data)) {
+      socket.emit('game:error', { message: 'Invalid action' });
+      return;
+    }
+    try {
+      const { gameId, userId, action, amount } = data;
+      const game = activeGames.get(gameId);
+      if (!game) {
+        socket.emit('game:error', { message: 'Game not found' });
+        return;
+      }
+      const result = await actionQueue.enqueue(gameId, () =>
+        game.processAction(userId, action, amount)
+      );
+      const tableId = game.getState().tableId;
+      io.to(`table:${tableId}`).emit('game:state', result);
+      logger.info('Action processed', { gameId, userId, action, amount });
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      socket.emit('game:error', { message: errMsg });
+      logger.error('Action error', { error: errMsg });
+    }
+  });
+
+  // ---------- RECONNECT ----------
+  socket.on('reconnect:request', async (data) => {
+    const { userId, gameId } = data;
+    const success = await reconnectManager.reconnectPlayer(userId, gameId);
+    if (success) {
+      const game = activeGames.get(gameId);
+      if (game) {
+        const state = game.getState();
+        const tableId = state.tableId;
+        socket.emit('game:state', state);
+        socket.join(`table:${tableId}`);
+        logger.info('Player reconnected', { userId, gameId });
+      }
+    } else {
+      socket.emit('reconnect:failed', { message: 'Could not restore game' });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    for (const [userId, sid] of userSocketMap) {
+      if (sid === socket.id) {
+        userSocketMap.delete(userId);
+        console.log(`❌ [SOCKET] Removed mapping for user ${userId}`);
+        break;
+      }
+    }
+    console.log(`🔴 [SOCKET] Player disconnected: ${socket.id}`);
+  });
+});
+
+// ============ START SERVER ============
+ensureTablesExist()
+  .then(() => recoverOrphanedGames())
+  .then(() => recoverGames())
+  .then(() => {
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log(`✅ Server running on port ${PORT}`);
+      console.log(`✅ WebSocket server ready`);
+    });
+  });
+
+export { server, io };

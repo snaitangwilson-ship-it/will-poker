@@ -1,0 +1,329 @@
+import { prisma } from '../database/client';
+import { Deck, Card } from './Deck';
+import { HandEvaluator, HandResult } from './HandEvaluator';
+import { GameStateManager } from './services/GameStateManager';
+import { BetManager } from './services/BetManager';
+import { PotManager } from './services/PotManager';
+import { DealerManager } from './services/DealerManager';
+import { ReconnectManager } from './services/ReconnectManager';
+import { TimerManager } from './services/TimerManager';
+import { logger } from '../utils/logger';
+
+export interface Player {
+  id: string;
+  userId: string;
+  seatId: string;
+  position: number;
+  stack: number;
+  bet: number;
+  isActive: boolean;
+  isAllIn: boolean;
+  hasFolded: boolean;
+  isSitOut: boolean;
+  holeCards: Card[];
+  isDealer: boolean;
+}
+
+export interface GameState {
+  gameId: string;
+  tableId: string;
+  status: string; // from GameStateManager
+  players: Player[];
+  communityCards: Card[];
+  pot: number;
+  sidePots: any[];
+  dealerPosition: number;
+  sbPosition: number;
+  bbPosition: number;
+  currentPlayerPosition: number;
+  currentBet: number;
+  lastRaiser: string | null;
+  actionHistory: string[];
+  smallBlind: number;
+  bigBlind: number;
+}
+
+export class PokerGame {
+  private state: GameState;
+  private deck: Deck;
+  private stateManager: GameStateManager;
+  private betManager: BetManager;
+  private potManager: PotManager;
+  private dealerManager: DealerManager;
+  private timerManager: TimerManager;
+  private io: any;
+  private tableId: string;
+  private gameId: string;
+  private actionTimeout = 20; // seconds
+
+  constructor(gameId: string, tableId: string, smallBlind: number, bigBlind: number, io: any) {
+    this.gameId = gameId;
+    this.tableId = tableId;
+    this.io = io;
+    this.deck = new Deck();
+    this.stateManager = new GameStateManager();
+    this.betManager = new BetManager();
+    this.potManager = new PotManager();
+    this.dealerManager = new DealerManager();
+    this.timerManager = new TimerManager();
+    this.state = {
+      gameId,
+      tableId,
+      status: 'WAITING',
+      players: [],
+      communityCards: [],
+      pot: 0,
+      sidePots: [],
+      dealerPosition: 0,
+      sbPosition: 0,
+      bbPosition: 0,
+      currentPlayerPosition: 0,
+      currentBet: 0,
+      lastRaiser: null,
+      actionHistory: [],
+      smallBlind,
+      bigBlind,
+    };
+  }
+
+  // ---------- Main game loop ----------
+  async startGame() {
+    await this.loadPlayers();
+    this.deck.reset();
+    this.stateManager.transitionTo('DEALER_ASSIGN');
+    await this.assignDealer();
+    this.stateManager.transitionTo('POST_SB');
+    await this.postBlinds();
+    this.stateManager.transitionTo('DEAL_HOLE');
+    await this.dealHoleCards();
+    this.stateManager.transitionTo('PREFLOP');
+    await this.startBettingRound('PREFLOP');
+  }
+
+  private async loadPlayers() {
+    const table = await prisma.pokerTable.findUnique({
+      where: { id: this.tableId },
+      include: { seats: { where: { isSitting: true, userId: { not: null } } } }
+    });
+    if (!table) throw new Error('Table not found');
+    this.state.players = table.seats.map(seat => ({
+      id: seat.id,
+      userId: seat.userId!,
+      seatId: seat.id,
+      position: seat.position,
+      stack: seat.stack || 0,
+      bet: 0,
+      isActive: true,
+      isAllIn: false,
+      hasFolded: false,
+      isSitOut: false,
+      holeCards: [],
+      isDealer: false,
+    }));
+  }
+
+  private async assignDealer() {
+    if (this.state.players.length < 2) return;
+    const dealerPos = this.dealerManager.rotateDealer(this.state.players);
+    this.state.dealerPosition = dealerPos;
+    this.state.sbPosition = this.dealerManager.assignSB(this.state.players, dealerPos);
+    this.state.bbPosition = this.dealerManager.assignBB(this.state.players, dealerPos);
+  }
+
+  private async postBlinds() {
+    const sb = this.state.players.find(p => p.position === this.state.sbPosition);
+    const bb = this.state.players.find(p => p.position === this.state.bbPosition);
+    if (!sb || !bb) return;
+    // Deduct blinds
+    const sbAmount = Math.min(this.state.smallBlind, sb.stack);
+    sb.stack -= sbAmount;
+    sb.bet = sbAmount;
+    const bbAmount = Math.min(this.state.bigBlind, bb.stack);
+    bb.stack -= bbAmount;
+    bb.bet = bbAmount;
+    this.state.pot = sbAmount + bbAmount;
+    this.state.currentBet = bbAmount;
+    this.state.actionHistory.push(`SB ${sb.userId} posts ${sbAmount}, BB ${bb.userId} posts ${bbAmount}`);
+    this.broadcastState();
+  }
+
+  private async dealHoleCards() {
+    for (const player of this.state.players) {
+      if (!player.isSitOut) {
+        player.holeCards = [this.deck.deal(), this.deck.deal()];
+      }
+    }
+    // Deal community cards later (flop, turn, river) with burns
+  }
+
+  private async startBettingRound(round: string) {
+    // Set current player to first active after BB
+    const bbPos = this.state.bbPosition;
+    const players = this.state.players.filter(p => p.isActive && !p.hasFolded && !p.isSitOut);
+    const bbIdx = players.findIndex(p => p.position === bbPos);
+    const firstIdx = (bbIdx + 1) % players.length;
+    this.state.currentPlayerPosition = players[firstIdx].position;
+    this.startTimer();
+    this.broadcastState();
+  }
+
+  // ---------- Action handling ----------
+  async processAction(userId: string, action: string, amount?: number) {
+    const player = this.state.players.find(p => p.userId === userId);
+    if (!player) throw new Error('Player not found');
+    const currentPlayer = this.state.players.find(p => p.position === this.state.currentPlayerPosition);
+    if (currentPlayer?.userId !== userId) throw new Error('Not your turn');
+
+    this.timerManager.reset();
+
+    switch (action) {
+      case 'fold':
+        player.hasFolded = true;
+        player.isActive = false;
+        this.state.actionHistory.push(`${userId} folds`);
+        break;
+      case 'check':
+        if (this.state.currentBet > player.bet) throw new Error('Cannot check, must call');
+        this.state.actionHistory.push(`${userId} checks`);
+        break;
+      case 'call':
+        const callAmount = this.betManager.getCallAmount(player, this.state.currentBet);
+        player.stack -= callAmount;
+        player.bet += callAmount;
+        this.state.pot += callAmount;
+        this.state.actionHistory.push(`${userId} calls ${callAmount}`);
+        break;
+      case 'bet':
+      case 'raise':
+        if (!amount) throw new Error('Amount required');
+        const minRaise = this.betManager.getMinRaise(this.state.currentBet, this.state.bigBlind);
+        if (!this.betManager.validateBet(player, amount, this.state.currentBet, minRaise)) {
+          throw new Error('Invalid bet amount');
+        }
+        const raiseAmount = amount - player.bet;
+        player.stack -= raiseAmount;
+        player.bet += raiseAmount;
+        this.state.pot += raiseAmount;
+        this.state.currentBet = player.bet;
+        this.state.lastRaiser = userId;
+        this.state.actionHistory.push(`${userId} ${action}s to ${player.bet}`);
+        break;
+      case 'all_in':
+        const allInAmount = player.stack;
+        player.stack = 0;
+        player.bet += allInAmount;
+        this.state.pot += allInAmount;
+        player.isAllIn = true;
+        if (player.bet > this.state.currentBet) {
+          this.state.currentBet = player.bet;
+          this.state.lastRaiser = userId;
+        }
+        this.state.actionHistory.push(`${userId} goes all-in ${allInAmount}`);
+        break;
+      default:
+        throw new Error('Invalid action');
+    }
+
+    // Move to next player
+    await this.advanceToNextPlayer();
+    this.broadcastState();
+  }
+
+  private async advanceToNextPlayer() {
+    // Find next active player
+    const players = this.state.players.filter(p => p.isActive && !p.hasFolded && !p.isAllIn && !p.isSitOut);
+    if (players.length <= 1) {
+      // End hand, go to showdown or award pot
+      await this.endHand();
+      return;
+    }
+    const currentIdx = players.findIndex(p => p.position === this.state.currentPlayerPosition);
+    const nextIdx = (currentIdx + 1) % players.length;
+    this.state.currentPlayerPosition = players[nextIdx].position;
+    this.startTimer();
+  }
+
+  private startTimer() {
+    this.timerManager.start(this.actionTimeout, async () => {
+      // Auto-fold or check if possible
+      const player = this.state.players.find(p => p.position === this.state.currentPlayerPosition);
+      if (!player) return;
+      if (this.state.currentBet > player.bet) {
+        // Auto-fold
+        await this.processAction(player.userId, 'fold');
+      } else {
+        // Auto-check
+        await this.processAction(player.userId, 'check');
+      }
+    }, (rem) => {
+      // Broadcast timer tick
+      this.io.to(`table:${this.tableId}`).emit('timer:tick', { userId: player.userId, remaining: rem });
+    });
+  }
+
+  private async endHand() {
+    // Showdown or award pot to last active player
+    const activePlayers = this.state.players.filter(p => p.isActive && !p.hasFolded && !p.isAllIn);
+    if (activePlayers.length === 1) {
+      // Award pot to last active
+      await this.awardPot(activePlayers[0]);
+    } else {
+      // Showdown
+      await this.showdown();
+    }
+  }
+
+  private async showdown() {
+    // Evaluate hands and determine winners
+    const activePlayers = this.state.players.filter(p => p.isActive && !p.hasFolded && !p.isAllIn);
+    if (activePlayers.length === 0) return;
+    const results = activePlayers.map(p => ({
+      player: p,
+      hand: HandEvaluator.evaluate(p.holeCards, this.state.communityCards)
+    }));
+    // Sort by hand strength
+    results.sort((a, b) => HandEvaluator.compareHands(a.hand, b.hand));
+    const winner = results[0];
+    await this.awardPot(winner.player);
+  }
+
+  private async awardPot(winner: Player) {
+    // Add pot to winner's stack and wallet
+    const wallet = await prisma.wallet.findUnique({ where: { userId: winner.userId } });
+    if (wallet) {
+      await prisma.wallet.update({
+        where: { userId: winner.userId },
+        data: { balance: wallet.balance + this.state.pot, locked: wallet.locked - winner.stack }
+      });
+    }
+    // Update seat stack
+    winner.stack += this.state.pot;
+    this.state.pot = 0;
+    this.state.actionHistory.push(`${winner.userId} wins the pot`);
+    this.broadcastState();
+    // Prepare next hand
+    await this.startGame();
+  }
+
+  private broadcastState() {
+    // Send personalized state to each player
+    for (const player of this.state.players) {
+      const pState = {
+        ...this.state,
+        players: this.state.players.map(p => ({
+          ...p,
+          holeCards: p.userId === player.userId ? p.holeCards : ['🃏', '🃏']
+        }))
+      };
+      this.io.to(player.userId).emit('game:state', pState);
+    }
+    // Send spectator view
+    const spectatorState = {
+      ...this.state,
+      players: this.state.players.map(p => ({ ...p, holeCards: ['🃏', '🃏'] }))
+    };
+    this.io.to(`table:${this.tableId}`).emit('game:state:spectator', spectatorState);
+  }
+
+  // Add other methods (burn, deal flop, turn, river) etc.
+}
